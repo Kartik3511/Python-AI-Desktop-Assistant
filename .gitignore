@@ -1,0 +1,59 @@
+# ============================================================
+# JARVIS Assistant - Git Ignore
+# ============================================================
+
+# Secrets & Live Configuration (Contains personal API keys)
+config.yaml
+.env
+*.env
+*.pem
+*.key
+
+# Local SQLite Database (Contains personal memory & preferences)
+data/*.db
+data/*.sqlite3
+data/*.db-journal
+data/*.db-wal
+!data/.gitkeep
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# Audio & Temporary files
+temp/
+tmp/
+*.tmp
+*.wav
+*.mp3
+!resources/*.mp3
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Package builds
+build/
+dist/
+*.egg-info/
