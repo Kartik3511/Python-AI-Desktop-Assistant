@@ -45,8 +45,12 @@ APP_LAUNCH_MAP: Dict[str, str] = {
     "spotify": "spotify",
     "edge": "msedge",
     "msedge": "msedge",
-    "microsoft edge": "msedge",
     "terminal": "wt",
+    "windows terminal": "wt",
+    "git bash": r"C:\Program Files\Git\git-bash.exe",
+    "git-bash": r"C:\Program Files\Git\git-bash.exe",
+    "gitbash": r"C:\Program Files\Git\git-bash.exe",
+    "bash": r"C:\Program Files\Git\git-bash.exe",
     "powershell": "powershell",
     "taskmgr": "taskmgr",
     "task manager": "taskmgr",
@@ -76,6 +80,11 @@ APP_PROCESS_MAP: Dict[str, str] = {
     "msedge": "msedge.exe",
     "microsoft edge": "msedge.exe",
     "terminal": "WindowsTerminal.exe",
+    "windows terminal": "WindowsTerminal.exe",
+    "git bash": "git-bash.exe",
+    "git-bash": "git-bash.exe",
+    "gitbash": "git-bash.exe",
+    "bash": "git-bash.exe",
     "powershell": "powershell.exe",
     "taskmgr": "Taskmgr.exe",
     "task manager": "Taskmgr.exe",
@@ -331,6 +340,17 @@ def open_application(app_name: str) -> str:
         target = "spotify"
     elif "terminal" in clean_name:
         target = "wt"
+    elif ("git" in clean_name and "bash" in clean_name) or clean_name == "bash":
+        git_bash_paths = [
+            r"C:\Program Files\Git\git-bash.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\git-bash.exe"),
+        ]
+        for p in git_bash_paths:
+            if os.path.exists(p):
+                target = p
+                break
+        if not target:
+            target = "git-bash"
     else:
         target = APP_LAUNCH_MAP.get(clean_name, raw_name)
 

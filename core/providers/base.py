@@ -66,6 +66,7 @@ TOOL_FUNCTIONS: dict[str, callable] = {
     "search_google": web_ops.search_google,
     # Memory & Workspace operations
     "remember_fact": memory_ops.remember_fact,
+    "store_memory": memory_ops.remember_fact,
     "recall_memory": memory_ops.recall_memory,
     "set_user_preference": memory_ops.set_user_preference,
     "get_user_preference": memory_ops.get_user_preference,
@@ -308,7 +309,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "search_youtube",
-        "description": "Search for videos on YouTube and open the results in the default web browser.",
+        "description": "Search for videos on YouTube and open the results in the default web browser. Call this WHENEVER the user asks to search for videos, channels, tournaments, games, music, or search on YouTube (e.g. 'Search for VCT champions tour', 'watch lofi', 'search cats on YouTube'). NEVER say you are searching or pretend to search without calling this tool.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -322,7 +323,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "search_google",
-        "description": "Perform a Google web search and open the search results in the default web browser.",
+        "description": "Perform a Google web search and open the search results in the default web browser. Call this WHENEVER the user asks to search the web, search Google, or find information online (e.g. 'Search for quantum computing', 'look up latest news'). NEVER say you are searching or pretend to search without calling this tool.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -337,13 +338,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     # ---- Persistent Memory & Proactive Workspaces ----
     {
         "name": "remember_fact",
-        "description": "Store a new personal fact, project note, or preference into persistent long-term memory across sessions.",
+        "description": "Store a new personal fact, project note, or preference into persistent long-term memory across sessions. Call this whenever the user says 'remember ...', 'save note ...', or asks to store any fact or preference. NEVER claim you cannot store memories or lack a memory tool.",
         "parameters": {
             "type": "object",
             "properties": {
                 "fact": {
                     "type": "string",
                     "description": "The fact or information to remember.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional category: 'personal', 'project', 'preference', 'tech', or 'general'.",
+                },
+            },
+            "required": ["fact"],
+        },
+    },
+    {
+        "name": "store_memory",
+        "description": "Alias for remember_fact. Store information or preferences into persistent long-term memory across sessions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": "The fact or preference to remember.",
                 },
                 "category": {
                     "type": "string",

@@ -212,11 +212,15 @@ class Speaker:
             return
 
         audio_queue: queue.Queue = queue.Queue(maxsize=3)
+        cancel_event = threading.Event()
 
         def producer():
             """Background worker thread: synthesizes sentences to temp mp3s."""
             try:
                 for sentence in sentence_generator:
+                    if cancel_event.is_set():
+                        logger.debug("TTS stream producer cancelled.")
+                        break
                     if not sentence or not sentence.strip():
                         continue
                     clean_sentence = sentence.strip()
@@ -232,12 +236,21 @@ class Speaker:
                     )
                     asyncio.run(communicate.save(temp_path))
 
+                    if cancel_event.is_set():
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
+                        break
+
                     if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                         audio_queue.put((temp_path, clean_sentence))
                     else:
                         logger.warning("Empty audio produced for sentence: '%s'", clean_sentence[:30])
             except Exception as e:
-                logger.error("Error in TTS stream producer: %s", e, exc_info=True)
+                if not cancel_event.is_set():
+                    logger.error("Error in TTS stream producer: %s", e, exc_info=True)
             finally:
                 # Sentinel to signal end of stream
                 audio_queue.put((None, None))
@@ -249,10 +262,12 @@ class Speaker:
             while True:
                 try:
                     # Timeout to avoid hanging indefinitely if producer dies
-                    temp_path, sent_text = audio_queue.get(timeout=30.0)
+                    temp_path, sent_text = audio_queue.get(timeout=20.0)
                 except queue.Empty:
                     logger.warning("TTS audio queue timed out waiting for next sentence.")
-
+                    cancel_event.set()
+                    if hasattr(sentence_generator, "cancel"):
+                        sentence_generator.cancel()
                     break
 
                 if temp_path is None:
@@ -289,7 +304,10 @@ class Speaker:
                                 time.sleep(0.05)
 
         finally:
-            producer_thread.join(timeout=1.0)
+            cancel_event.set()
+            if hasattr(sentence_generator, "cancel"):
+                sentence_generator.cancel()
+            producer_thread.join(timeout=0.5)
             # Drain remaining items and delete unplayed temp files
             while not audio_queue.empty():
                 try:

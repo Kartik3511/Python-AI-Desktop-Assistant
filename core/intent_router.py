@@ -15,6 +15,7 @@ from datetime import datetime
 import logging
 import random
 import re
+import time
 from typing import Callable, Generator, List, Optional
 
 import urllib.parse
@@ -137,6 +138,10 @@ KNOWN_APPS = {
     "command prompt": "cmd",
     "terminal": "terminal",
     "windows terminal": "terminal",
+    "git bash": "git bash",
+    "git-bash": "git bash",
+    "gitbash": "git bash",
+    "bash": "git bash",
     "task manager": "taskmgr",
     "taskmgr": "taskmgr",
     "explorer": "explorer",
@@ -171,7 +176,26 @@ class IntentRouter:
 
     def __init__(self):
         self._previous_volume: int = 50
+        self._last_context: Optional[str] = None
+        self._last_context_time: float = 0.0
+        self._current_raw_text: str = ""
         logger.info("Local IntentRouter initialized with fast-path patterns.")
+
+    def _extract_original_casing(self, clean_term: str) -> str:
+        """Preserve original casing from user speech for search query presentation."""
+        if not clean_term or not getattr(self, "_current_raw_text", ""):
+            return clean_term
+        words = clean_term.split()
+        if not words:
+            return clean_term
+        try:
+            pattern = r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b"
+            m = re.search(pattern, self._current_raw_text, re.IGNORECASE)
+            if m:
+                return m.group(0)
+        except Exception:
+            pass
+        return clean_term
 
     def match_and_execute(self, user_text: str) -> Optional[FastPathResult]:
         """Classify user speech and execute matched local deterministic actions.
@@ -189,6 +213,7 @@ class IntentRouter:
         if not raw:
             return None
 
+        self._current_raw_text = raw
         # Normalize text: lowercase, strip punctuation except '%'
         clean = re.sub(r"[^\w\s%'-]", "", raw.lower()).strip()
 
@@ -326,12 +351,17 @@ class IntentRouter:
         if ws_act is not None:
             return ws_act
 
-        # 8. Applications
+        # 8. Memory & Knowledge (Remember, Recall Notes)
+        mem_act = self._parse_memory(c)
+        if mem_act is not None:
+            return mem_act
+
+        # 9. Applications
         app_act = self._parse_application(c)
         if app_act is not None:
             return app_act
 
-        # 9. Dismissal
+        # 10. Dismissal
         dis_act = self._parse_dismissal(c)
         if dis_act is not None:
             return dis_act
@@ -712,9 +742,14 @@ class IntentRouter:
 
         Intercepts web and media searches locally in <1ms without consuming cloud LLM tokens.
         """
+        now = time.time()
+        in_youtube_context = (self._last_context == "youtube" and (now - self._last_context_time) < 90.0)
+
         # 1. YouTube Direct Navigation: e.g. "open youtube", "launch youtube", "go to youtube"
         if re.match(r"^(?:open|launch|go\s+to)?\s*youtube$", clean.strip(), re.IGNORECASE) or clean.strip().lower() == "youtube":
             url = "https://www.youtube.com"
+            self._last_context = "youtube"
+            self._last_context_time = now
             logger.info("Local Intent matched: Direct YouTube navigation")
             return LocalAction(
                 action_type="open_youtube",
@@ -726,7 +761,6 @@ class IntentRouter:
 
         # 2. YouTube Search:
         # Matches queries ending with "on/in youtube" or starting with "youtube search/play/start"
-        # Handles phonetic STT slips (e.g. "sart", "serch") and phrases like "Hanuman Chalisa on YouTube"
         yt_search = re.search(
             r"(?:(?:search(?:\s+for)?|sart|start|serch|play|find|look\s+up|put\s+on|stream|show|open)\s+)?(.+?)\s+(?:on|in)\s+youtube\b",
             clean,
@@ -738,6 +772,18 @@ class IntentRouter:
                 clean,
                 re.IGNORECASE,
             )
+
+        # Contextual YouTube search: e.g. when YouTube was just opened and Jarvis asked "What shall we watch?"
+        if not yt_search and in_youtube_context:
+            yt_search = re.search(
+                r"^(?:(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:search\s+(?:for\s+)?|play\s+|watch\s+|find\s+|show\s+|look\s+up\s+|put\s+on\s+))(.+)",
+                clean,
+                re.IGNORECASE,
+            )
+            # Or if user simply speaks a video title/channel in follow-up mode
+            if not yt_search and not any(clean.startswith(w) for w in ("open ", "launch ", "close ", "set ", "turn ", "lock ", "volume ", "brightness ", "what ", "who ", "how ", "where ", "why ", "when ", "is ", "can ", "could ")):
+                if len(clean.split()) >= 1 and clean not in ("yes", "no", "sure", "cancel", "stop", "exit", "quit"):
+                    yt_search = re.match(r"^(.+)$", clean)
 
         if yt_search:
             raw_query = yt_search.group(1).strip()
@@ -755,19 +801,46 @@ class IntentRouter:
                 flags=re.IGNORECASE,
             )
             clean_query = re.sub(r"[?.!,]+$", "", clean_query).strip(" '\"")
-            if clean_query:
-                encoded = urllib.parse.quote_plus(clean_query)
+            if clean_query and clean_query.lower() not in ("chrome", "edge", "notepad", "settings", "updates", "terminal"):
+                display_query = self._extract_original_casing(clean_query)
+                encoded = urllib.parse.quote_plus(display_query)
                 url = f"https://www.youtube.com/results?search_query={encoded}"
-                logger.info("Local Intent matched: YouTube search for '%s'", clean_query)
+                self._last_context = "youtube"
+                self._last_context_time = now
+                logger.info("Local Intent matched: YouTube search for '%s'", display_query)
                 return LocalAction(
                     action_type="youtube_search",
                     execute_fn=lambda u=url: web_ops.open_website(u),
-                    confirm_phrase=f"searching '{clean_query}' on YouTube",
+                    confirm_phrase=f"searching '{display_query}' on YouTube",
                     needs_follow_up=True,
-                    standalone_response=f"Searching for '{clean_query}' on YouTube, sir. [FOLLOW_UP]",
+                    standalone_response=f"Searching for '{display_query}' on YouTube, sir. [FOLLOW_UP]",
                 )
 
-        # 3. Google Search: e.g. "search sidemen on google", "google python documentation"
+        # 3. Direct Play / Watch commands -> YouTube search (even outside YouTube context)
+        play_match = re.search(
+            r"^(?:(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:play|watch|put\s+on|listen\s+to)\s+)(.+)",
+            clean,
+            re.IGNORECASE,
+        )
+        if play_match:
+            raw_p = play_match.group(1).strip()
+            clean_p = re.sub(r"[?.!,]+$", "", raw_p).strip(" '\"")
+            if clean_p and clean_p.lower() not in ("music", "songs", "video", "something"):
+                display_p = self._extract_original_casing(clean_p)
+                encoded = urllib.parse.quote_plus(display_p)
+                url = f"https://www.youtube.com/results?search_query={encoded}"
+                self._last_context = "youtube"
+                self._last_context_time = now
+                logger.info("Local Intent matched: Direct YouTube play/watch for '%s'", display_p)
+                return LocalAction(
+                    action_type="youtube_search",
+                    execute_fn=lambda u=url: web_ops.open_website(u),
+                    confirm_phrase=f"playing '{display_p}' on YouTube",
+                    needs_follow_up=True,
+                    standalone_response=f"Playing '{display_p}' on YouTube, sir. [FOLLOW_UP]",
+                )
+
+        # 4. Google Search: explicit ("on google", "google ...") OR direct general search ("search for ...", "look up ...")
         g_search = re.search(
             r"\b(?:search\s+(?:for\s+)?|look\s+up\s+|find\s+)(.+?)\s+(?:on|in)\s+google\b",
             clean,
@@ -779,20 +852,28 @@ class IntentRouter:
                 clean,
                 re.IGNORECASE,
             )
+        # Direct general search: "search for X", "look up X" (when not matching apps, memory, or settings)
+        if not g_search:
+            g_search = re.search(
+                r"^(?:(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:search\s+(?:for\s+)?|look\s+up\s+|find\s+))(.+)",
+                clean,
+                re.IGNORECASE,
+            )
 
         if g_search:
-            query = g_search.group(1).strip()
-            query = re.sub(r"[?.!,]+$", "", query).strip(" '\"")
-            if query and query.lower() not in ("chrome", "maps", "drive", "docs"):
-                encoded = urllib.parse.quote_plus(query)
+            raw_g = g_search.group(1).strip()
+            query = re.sub(r"[?.!,]+$", "", raw_g).strip(" '\"")
+            if query and query.lower() not in ("chrome", "maps", "drive", "docs", "settings", "updates", "terminal", "edge", "notepad"):
+                display_q = self._extract_original_casing(query)
+                encoded = urllib.parse.quote_plus(display_q)
                 url = f"https://www.google.com/search?q={encoded}"
-                logger.info("Local Intent matched: Google search for '%s'", query)
+                logger.info("Local Intent matched: Google search for '%s'", display_q)
                 return LocalAction(
                     action_type="google_search",
                     execute_fn=lambda u=url: web_ops.open_website(u),
-                    confirm_phrase=f"searching '{query}' on Google",
+                    confirm_phrase=f"searching '{display_q}' on Google",
                     needs_follow_up=True,
-                    standalone_response=f"Searching Google for '{query}', sir. [FOLLOW_UP]",
+                    standalone_response=f"Searching Google for '{display_q}', sir. [FOLLOW_UP]",
                 )
 
         # 4. Common Portal Navigation: e.g. "open github", "open reddit", "go to wikipedia"
@@ -849,8 +930,31 @@ class IntentRouter:
                 re.IGNORECASE,
             )
 
+        WORKSPACE_ALIASES = {
+            "quoting": "coding",
+            "coating": "coding",
+            "code": "coding",
+            "developer": "coding",
+            "dev": "coding",
+            "development": "coding",
+            "work": "focus",
+            "working": "focus",
+            "deepwork": "focus",
+            "music": "media",
+            "video": "media",
+            "videos": "media",
+            "game": "gaming",
+            "games": "gaming",
+            "studying": "study",
+            "learn": "study",
+            "learning": "study",
+            "meet": "meeting",
+            "call": "meeting",
+        }
+
         if ws_match:
-            ws_candidate = ws_match.group(1).strip().lower()
+            raw_candidate = ws_match.group(1).strip().lower()
+            ws_candidate = WORKSPACE_ALIASES.get(raw_candidate, raw_candidate)
             mm = get_memory_manager()
             ws_info = mm.get_workspace(ws_candidate)
             if ws_info:
@@ -862,7 +966,16 @@ class IntentRouter:
 
                 details = []
                 if apps:
-                    app_names = [("VS Code" if a == "code" else ("Edge" if a == "edge" else a.title())) for a in apps]
+                    app_names = [
+                        ("VS Code" if a in ("code", "vscode") else (
+                            "Terminal" if a in ("terminal", "wt") else (
+                                "Git Bash" if a in ("git bash", "git-bash", "bash") else (
+                                    "Edge" if a == "edge" else a.title()
+                                )
+                            )
+                        ))
+                        for a in apps
+                    ]
                     details.append(f"{', '.join(app_names)} launched")
                 if bright is not None:
                     details.append(f"brightness set to {bright} percent")
@@ -880,5 +993,84 @@ class IntentRouter:
                     needs_follow_up=True,
                     standalone_response=ack,
                 )
+
+        return None
+
+    def _parse_memory(self, clean: str) -> Optional[LocalAction]:
+        """Parse persistent memory storage and recall commands.
+
+        Intercepts commands like:
+        - "remember my favorite coding language is java"
+        - "remember that I prefer dark mode"
+        - "what is my favorite coding language"
+        - "what do you remember about my coding language"
+        - "recall memory about coding"
+        """
+        # 1. Storing facts / memories
+        rem_match = re.search(
+            r"^(?:(?:please\s+|can\s+you\s+|could\s+you\s+)?remember\s+(?:that\s+)?|note\s+that\s+|keep\s+in\s+mind\s+(?:that\s+)?)(.+)",
+            clean,
+            re.IGNORECASE,
+        )
+        if rem_match:
+            raw_fact = rem_match.group(1).strip()
+            clean_fact = re.sub(r"[?.!,]+$", "", raw_fact).strip(" '\"")
+            if clean_fact:
+                mm = get_memory_manager()
+                lower_fact = clean_fact.lower()
+                if any(w in lower_fact for w in ("favorite", "favourite", "prefer", "preference", "like", "love")):
+                    category = "preference"
+                elif any(w in lower_fact for w in ("project", "code", "coding", "jarvis", "program", "app", "dev")):
+                    category = "project"
+                else:
+                    category = "personal"
+
+                display_fact = clean_fact
+                if display_fact.lower().startswith("my "):
+                    display_fact = "your " + display_fact[3:]
+
+                ack = f"Noted, sir. I have committed to memory that {display_fact}. [FOLLOW_UP]"
+                logger.info("Local Intent matched: Store fact '%s' (category=%s)", clean_fact, category)
+                return LocalAction(
+                    action_type="remember_fact",
+                    execute_fn=lambda f=clean_fact, cat=category: mm.remember_fact(fact=f, category=cat),
+                    confirm_phrase=f"remembered {clean_fact}",
+                    needs_follow_up=True,
+                    standalone_response=ack,
+                )
+
+        # 2. Recalling facts / memories
+        rec_match = re.search(
+            r"\b(?:what\s+do\s+you\s+remember(?:\s+about\s+(.+))?|recall\s+(?:memory|memories|facts|notes)(?:\s+about\s+(.+))?|what\s+is\s+my\s+(.+)|what\s+are\s+my\s+(.+))\b",
+            clean,
+            re.IGNORECASE,
+        )
+        if rec_match:
+            query = None
+            for g in rec_match.groups():
+                if g is not None and g.strip():
+                    query = g.strip()
+                    break
+
+            if query:
+                clean_query = re.sub(r"[?.!,]+$", "", query).strip(" '\"")
+                if clean_query.lower() not in ("battery", "cpu", "ram", "ip", "volume", "brightness", "time"):
+                    mm = get_memory_manager()
+                    search_term = re.sub(r"^(?:my|your|the|about|our)\s+", "", clean_query, flags=re.IGNORECASE).strip()
+                    facts = mm.recall_facts(query=search_term or clean_query, limit=1)
+                    if facts:
+                        found_fact = facts[0]["fact"]
+                        disp = found_fact
+                        if disp.lower().startswith("my "):
+                            disp = "your " + disp[3:]
+                        ack = f"According to my memory records, sir: {disp}. [FOLLOW_UP]"
+                        logger.info("Local Intent matched: Recall fact for '%s' -> '%s'", clean_query, found_fact)
+                        return LocalAction(
+                            action_type="recall_memory",
+                            execute_fn=lambda: None,
+                            confirm_phrase=f"recalled: {disp}",
+                            needs_follow_up=True,
+                            standalone_response=ack,
+                        )
 
         return None

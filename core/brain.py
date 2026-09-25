@@ -9,6 +9,7 @@ falls back to the next one. Once a provider succeeds, it becomes the
 
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Iterable, Optional
 
@@ -86,11 +87,19 @@ class BrainStreamResult:
         self.needs_follow_up = False
         self.full_text = ""
         self._sentences: list[str] = []
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Signal cancellation to terminate generator iterations early."""
+        self._cancelled = True
 
     def __iter__(self):
         return self
 
     def __next__(self) -> str:
+        if self._cancelled:
+            raise StopIteration
+
         while True:
             try:
                 raw_sentence = next(self._generator)
@@ -101,6 +110,9 @@ class BrainStreamResult:
                     if "?" in last_sentence:
                         self.needs_follow_up = True
                 raise
+
+            if self._cancelled:
+                raise StopIteration
 
             clean_sentence = raw_sentence
             if "[FOLLOW_UP]" in clean_sentence:
@@ -176,8 +188,8 @@ class Brain:
         # Initialize zero-latency local intent router (<1ms)
         self.intent_router = IntentRouter()
 
-        # Start with the first provider
-        self._active_index = 0
+        # Priority provider tracking and rate-limit cooldowns
+        self._provider_cooldowns: dict[str, float] = {}
         logger.info(
             "Brain initialized with %d provider(s): %s",
             len(self._providers),
@@ -185,15 +197,15 @@ class Brain:
         )
 
     @property
-    def active_provider(self) -> BaseProvider:
-        """The currently active provider."""
-        return self._providers[self._active_index]
+    def active_provider(self) -> Optional[BaseProvider]:
+        """The primary configured provider."""
+        return self._providers[0] if self._providers else None
 
     def think(self, user_text: str) -> str:
-        """Process user input through the active provider, with fallback.
+        """Process user input through providers in priority order, with automatic fallback.
 
-        Tries the active provider first. On failure, moves to the next
-        provider in the chain. Wraps around if all providers have been tried.
+        Always prioritizes the primary fast provider (index 0). If a provider is in rate-limit
+        cooldown or fails, cascades immediately to the next available fallback provider.
 
         Args:
             user_text: The transcribed user speech.
@@ -213,12 +225,16 @@ class Brain:
             self.record_turn(user_text, fast_res.full_text)
             return fast_res.full_text
 
-        # Try each provider starting from the active one
-        attempts = 0
-        total_providers = len(self._providers)
-
-        while attempts < total_providers:
-            provider = self._providers[self._active_index]
+        # ── 2. Priority-Ordered Provider Cascade ─────────────────────
+        now = time.time()
+        for provider in self._providers:
+            cooldown_until = self._provider_cooldowns.get(provider.name, 0.0)
+            if now < cooldown_until:
+                logger.info(
+                    "Provider %s is in rate-limit cooldown (%.1fs remaining). Skipping to next provider.",
+                    provider, cooldown_until - now,
+                )
+                continue
 
             for retry in range(self._max_retries + 1):
                 try:
@@ -227,7 +243,6 @@ class Brain:
                         provider, retry + 1, self._max_retries + 1,
                         self._timeout,
                     )
-                    # Run with timeout — skip provider if too slow
                     future = self._executor.submit(provider.think, user_text)
                     response = future.result(timeout=self._timeout)
                     logger.info("Response from %s: %s", provider, response[:100])
@@ -238,21 +253,20 @@ class Brain:
                         "%s timed out after %ds (attempt %d). Skipping.",
                         provider, self._timeout, retry + 1,
                     )
-                    break  # Don't retry on timeout, move to next provider
+                    break
 
                 except Exception as e:
+                    err_str = str(e).lower()
+                    if any(k in err_str for k in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted")):
+                        logger.warning("Provider %s hit rate limit; setting 30s cooldown: %s", provider, e)
+                        self._provider_cooldowns[provider.name] = time.time() + 30.0
+                        break
                     logger.warning(
                         "%s failed (attempt %d): %s",
                         provider, retry + 1, e,
                     )
 
-            # This provider exhausted its retries — move to next
-            logger.warning(
-                "%s exhausted all retries. Falling back to next provider...",
-                provider,
-            )
-            self._active_index = (self._active_index + 1) % total_providers
-            attempts += 1
+            logger.warning("%s exhausted all retries. Falling back to next provider...", provider)
 
         # All providers failed
         logger.error("All providers failed.")
@@ -262,7 +276,7 @@ class Brain:
         )
 
     def think_stream(self, user_text: str) -> BrainStreamResult:
-        """Process user input through providers with streaming and fallback.
+        """Process user input through providers with streaming, strict timeouts, and fallback.
 
         Yields sentences one by one as they are synthesized, enabling
         sub-second perceived voice latency and follow-up intent detection.
@@ -290,44 +304,69 @@ class Brain:
             result.needs_follow_up = fast_res.needs_follow_up
             return result
 
-        def _orchestrated_stream():
-            attempts = 0
-            total_providers = len(self._providers)
+        result_holder: list[BrainStreamResult] = []
 
-            while attempts < total_providers:
-                provider = self._providers[self._active_index]
+        def _orchestrated_stream():
+            now = time.time()
+            for provider in self._providers:
+                cooldown_until = self._provider_cooldowns.get(provider.name, 0.0)
+                if now < cooldown_until:
+                    logger.info(
+                        "Provider %s is in rate-limit cooldown (%.1fs remaining). Skipping to next provider.",
+                        provider, cooldown_until - now,
+                    )
+                    continue
+
                 for retry in range(self._max_retries + 1):
                     try:
                         logger.info(
-                            "Trying %s stream (attempt %d/%d)...",
-                            provider, retry + 1, self._max_retries + 1,
+                            "Trying %s stream (attempt %d/%d, timeout %ds)...",
+                            provider, retry + 1, self._max_retries + 1, self._timeout,
                         )
                         gen = provider.think_stream(user_text)
-                        # Fetch the first sentence to verify connectivity and tool execution
-                        first_sentence = next(gen, None)
+
+                        # Enforce strict timeout for the initial sentence
+                        fut = self._executor.submit(lambda g=gen: next(g, None))
+                        try:
+                            first_sentence = fut.result(timeout=self._timeout)
+                        except TimeoutError:
+                            logger.warning(
+                                "%s stream timed out after %ds waiting for first sentence. Falling back to next provider...",
+                                provider, self._timeout,
+                            )
+                            break
+
                         if first_sentence is not None:
                             logger.info("First streamed sentence from %s: '%s'", provider, first_sentence[:60])
                             yield first_sentence
-                            yield from gen
+                            for sent in gen:
+                                if result_holder and result_holder[0]._cancelled:
+                                    logger.debug("Brain stream generation cancelled by consumer.")
+                                    return
+                                yield sent
                             return
                         else:
                             logger.warning("%s produced empty stream.", provider)
                             break
 
                     except Exception as e:
+                        err_str = str(e).lower()
+                        if any(k in err_str for k in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted")):
+                            logger.warning("Provider %s hit rate limit; setting 30s cooldown: %s", provider, e)
+                            self._provider_cooldowns[provider.name] = time.time() + 30.0
+                            break
                         logger.warning("%s stream failed (attempt %d): %s", provider, retry + 1, e)
 
-                # Provider failed, try next
                 logger.warning("%s stream exhausted. Falling back to next provider...", provider)
-                self._active_index = (self._active_index + 1) % total_providers
-                attempts += 1
 
             # All providers failed
             logger.error("All providers failed in stream mode.")
             yield "I am having trouble connecting to my AI services right now, sir. Please check your network connection."
 
-        active_provider_name = str(self._providers[self._active_index]) if self._providers else "none"
-        return BrainStreamResult(_orchestrated_stream(), provider_name=active_provider_name)
+        primary_name = str(self._providers[0]) if self._providers else "none"
+        res = BrainStreamResult(_orchestrated_stream(), provider_name=primary_name)
+        result_holder.append(res)
+        return res
 
     def clear_history(self):
         """Clear conversation history on all providers."""

@@ -117,11 +117,11 @@ class MemoryManager:
                 default_workspaces = [
                     (
                         "coding",
-                        "Development environment with Visual Studio Code and Microsoft Edge",
+                        "Development environment with Visual Studio Code, Terminal, and Git Bash",
                         json.dumps({
-                            "apps": ["code", "edge"],
-                            "volume": 40,
-                            "brightness": 80,
+                            "apps": ["code", "terminal", "git bash"],
+                            "volume": 50,
+                            "brightness": 100,
                             "urls": [],
                         }),
                     ),
@@ -350,7 +350,17 @@ class MemoryManager:
             if app and str(app).strip():
                 try:
                     res = system_ops.open_application(str(app).strip())
-                    disp = "Microsoft Edge" if "edge" in app.lower() else ("VS Code" if "code" in app.lower() else app.title())
+                    app_lower = app.lower()
+                    if "edge" in app_lower:
+                        disp = "Microsoft Edge"
+                    elif "code" in app_lower:
+                        disp = "VS Code"
+                    elif "terminal" in app_lower or app_lower == "wt":
+                        disp = "Terminal"
+                    elif "git" in app_lower or "bash" in app_lower:
+                        disp = "Git Bash"
+                    else:
+                        disp = app.title()
                     opened_apps.append(disp)
                 except Exception as e:
                     logger.warning("Failed to launch application '%s' in workspace %s: %s", app, clean_name, e)
